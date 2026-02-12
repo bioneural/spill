@@ -346,6 +346,90 @@ test_cli_rotate() {
 }
 test_cli_rotate
 
+# ---------------------------------------------------------------------------
+section "Auto-rotation"
+# ---------------------------------------------------------------------------
+
+test_auto_rotate() {
+  local rot_dir="$TMPDIR_TEST/auto-rotate"
+  mkdir -p "$rot_dir"
+  local rot_log="$rot_dir/spill.jsonl"
+
+  # Write enough data to exceed a 500-byte threshold
+  ruby -e '
+    require "'"$SPILL_ROOT/lib/spill"'"
+    Spill.configure(tool: "rot-test", log: "'"$rot_log"'", max_size: 500)
+    20.times { |i| Spill.info("message number #{i} with padding to increase line size") }
+  ' 2>/dev/null
+
+  local rotated_count
+  rotated_count=$(ls "$rot_dir"/spill-*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$rotated_count" -gt 0 ]]; then
+    pass "Auto-rotation triggers when log exceeds max_size"
+  else
+    fail "Auto-rotation" "no rotated files found (expected at least 1)"
+  fi
+
+  # Current log should exist and be under the threshold
+  if [[ -f "$rot_log" ]]; then
+    local current_size
+    current_size=$(wc -c < "$rot_log" | tr -d ' ')
+    if [[ "$current_size" -lt 500 ]]; then
+      pass "Current log is under max_size after rotation"
+    else
+      fail "Post-rotation size" "current log is $current_size bytes, expected < 500"
+    fi
+  else
+    # Exactly at rotation boundary — log was rotated, no new writes. Acceptable.
+    pass "Current log is under max_size after rotation"
+  fi
+}
+test_auto_rotate
+
+test_auto_cull() {
+  local cull_dir="$TMPDIR_TEST/auto-cull"
+  mkdir -p "$cull_dir"
+  local cull_log="$cull_dir/spill.jsonl"
+
+  # max_size=200, keep=2: should rotate frequently, cull down to 2 old files
+  ruby -e '
+    require "'"$SPILL_ROOT/lib/spill"'"
+    Spill.configure(tool: "cull-test", log: "'"$cull_log"'", max_size: 200, keep: 2)
+    50.times { |i| Spill.info("cull message #{i} with extra padding text here") }
+  ' 2>/dev/null
+
+  local rotated_count
+  rotated_count=$(ls "$cull_dir"/spill-*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$rotated_count" -le 2 ]]; then
+    pass "Culling keeps at most 2 rotated files (found $rotated_count)"
+  else
+    fail "Culling" "expected <= 2 rotated files, found $rotated_count"
+  fi
+}
+test_auto_cull
+
+test_rotation_disabled() {
+  local nodis_dir="$TMPDIR_TEST/no-rotate"
+  mkdir -p "$nodis_dir"
+  local nodis_log="$nodis_dir/spill.jsonl"
+
+  # max_size=0 disables auto-rotation
+  ruby -e '
+    require "'"$SPILL_ROOT/lib/spill"'"
+    Spill.configure(tool: "no-rot", log: "'"$nodis_log"'", max_size: 0)
+    20.times { |i| Spill.info("no rotate #{i}") }
+  ' 2>/dev/null
+
+  local rotated_count
+  rotated_count=$(ls "$nodis_dir"/spill-*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$rotated_count" -eq 0 ]]; then
+    pass "Auto-rotation disabled when max_size is 0"
+  else
+    fail "Rotation disabled" "expected 0 rotated files, found $rotated_count"
+  fi
+}
+test_rotation_disabled
+
 # Clean up
 rm -rf "$TMPDIR_TEST"
 unset SPILL_LOG

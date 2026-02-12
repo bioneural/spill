@@ -171,12 +171,18 @@ spill() {
 
 **Single destination.** All tools write to the same file: `.state/spill/spill.jsonl` in the working directory. One file to tail, search, rotate, and eventually feed to an agent for health monitoring.
 
+**Auto-rotation.** When a log file exceeds `max_size` (default 1 MB), the next write renames it to a timestamped file (`spill-20260211-143207.jsonl`) and starts fresh. Old rotated files beyond the `keep` count (default 5) are deleted. Total disk usage stays bounded at roughly `(keep + 1) * max_size` — 6 MB with defaults. Rotation is size-based, not date-based. A log that never hits 1 MB never rotates.
+
+Rotation is fail-open and race-safe. If two processes detect the threshold simultaneously, one rename succeeds and the other is silently rescued. The next write from either process creates a fresh log file.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SPILL_LOG` | `.state/spill/spill.jsonl` | Path to the log file |
 | `SPILL_HOME` | `../../spill` (sibling directory) | Path to the spill repo (for `require`) |
+| `SPILL_MAX_SIZE` | `1048576` (1 MB) | Rotate when log exceeds this size in bytes. Set to `0` to disable auto-rotation. |
+| `SPILL_KEEP` | `5` | Number of rotated files to keep. Older files are deleted. |
 
 ---
 
@@ -215,8 +221,14 @@ CLI — bin/spill
   ✓ bin/spill read outputs raw JSONL
   ✓ bin/spill rotate moves log to timestamped file
 
+Auto-rotation
+  ✓ Auto-rotation triggers when log exceeds max_size
+  ✓ Current log is under max_size after rotation
+  ✓ Culling keeps at most 2 rotated files
+  ✓ Auto-rotation disabled when max_size is 0
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-18 passed
+22 passed
 ```
 
 Tests run against a temporary directory that is created and destroyed on each run. No artifacts are left behind.

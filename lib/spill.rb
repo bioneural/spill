@@ -1,4 +1,4 @@
-# lib/spill.rb — structured logging for autonomous agent tooling
+# lib/spill.rb — centralized structured logging
 #
 # Usage:
 #   require '/path/to/spill/lib/spill'

@@ -1,10 +1,12 @@
 <h1 align="center">
   s p i l l
   <br>
-  <sub>structured logging for autonomous agent tooling</sub>
+  <sub>centralized structured logging</sub>
 </h1>
 
-Spill is a centralized structured logging library for autonomous agent tooling. Tools in an agent ecosystem write diagnostic output to stderr as free-form text — no timestamps, no levels, no structure. Spill captures that output as JSON Lines, adding timestamps, levels, and structured context while preserving existing stderr behavior byte-for-byte. When an agent needs to understand what happened across multiple tools, spill provides a single queryable log instead of grep-and-hope across scattered streams.
+Seven tools write diagnostic output to stderr. Free-form text. No timestamps, no levels, no queryable structure. When something breaks at 3 AM, the only option is grep across scattered streams and hope the right line surfaces.
+
+Spill replaces hope with structure. Every diagnostic message becomes a JSON line — timestamped, leveled, tagged by source tool — while the original stderr output is preserved unchanged. One log file. One place to look.
 
 A single module. No gems. No external dependencies. Ruby stdlib only.
 

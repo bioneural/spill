@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# spill — structured log reader and management
+# spill — structured log reader and management tool
 #
 # Reads and manages a centralized JSONL log.
 #

@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+
+# smoke-test — end-to-end verification of spill structured logging
+#
+# Tests the full cycle: write each level, verify JSONL structure,
+# verify stderr output preserved, test concurrent writes, test CLI.
+#
+# Usage:
+#   test/smoke-test
+#
+# Dependencies: bash, ruby
+#
+# Behavior:
+#   1. Runs each test in sequence
+#   2. Prints pass/fail for each
+#   3. Exits 0 if all pass, 1 if any fail
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SPILL_ROOT="$(dirname "$SCRIPT_DIR")"
+cd "$SPILL_ROOT"
+
+passed=0
+failed=0
+failures=()
+
+pass() {
+  printf "  \033[32m✓\033[0m %s\n" "$1"
+  ((passed++))
+}
+
+fail() {
+  printf "  \033[31m✗\033[0m %s — %s\n" "$1" "$2"
+  ((failed++))
+  failures+=("$1")
+}
+
+section() {
+  printf "\n\033[1m%s\033[0m\n" "$1"
+}
+
+# ---------------------------------------------------------------------------
+section "Structure"
+# ---------------------------------------------------------------------------
+
+test_structure() {
+  local missing=()
+  local paths=(
+    "lib/spill.rb"
+    "bin/spill"
+    "test/smoke-test"
+    "README.md"
+    "LICENSE"
+  )
+  for p in "${paths[@]}"; do
+    [[ -e "$p" ]] || missing+=("$p")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    pass "All expected paths exist"
+  else
+    fail "Missing paths" "${missing[*]}"
+  fi
+}
+test_structure
+
+test_executables() {
+  local not_exec=()
+  for script in bin/spill test/smoke-test; do
+    [[ -x "$script" ]] || not_exec+=("$script")
+  done
+  if [[ ${#not_exec[@]} -eq 0 ]]; then
+    pass "All scripts are executable"
+  else
+    fail "Not executable" "${not_exec[*]}"
+  fi
+}
+test_executables
+
+# ---------------------------------------------------------------------------
+section "Syntax"
+# ---------------------------------------------------------------------------
+
+test_ruby_syntax() {
+  local bad=()
+  for script in lib/spill.rb bin/spill; do
+    ruby -c "$script" >/dev/null 2>&1 || bad+=("$script")
+  done
+  if [[ ${#bad[@]} -eq 0 ]]; then
+    pass "Ruby scripts pass syntax check"
+  else
+    fail "Syntax errors" "${bad[*]}"
+  fi
+}
+test_ruby_syntax
+
+# ---------------------------------------------------------------------------
+section "Logging"
+# ---------------------------------------------------------------------------
+
+TMPDIR_TEST=$(mktemp -d)
+TEST_LOG="$TMPDIR_TEST/spill.jsonl"
+
+test_log_levels() {
+  local output
+  output=$(ruby -e '
+    require "'"$SPILL_ROOT/lib/spill"'"
+    Spill.configure(tool: "test-tool", log: "'"$TEST_LOG"'")
+    Spill.info("info message", key: "val")
+    Spill.warn("warn message")
+    Spill.error("error message", code: 1)
+    Spill.debug("debug message")
+  ' 2>&1)
+
+  # Check stderr preserves tool: msg format
+  if echo "$output" | grep -q "test-tool: info message" && \
+     echo "$output" | grep -q "test-tool: warn message" && \
+     echo "$output" | grep -q "test-tool: error message" && \
+     echo "$output" | grep -q "test-tool: debug message"; then
+    pass "stderr output preserves tool: msg format"
+  else
+    fail "stderr format" "expected 'test-tool: <msg>' for each level, got: $output"
+  fi
+
+  # Check JSONL file has 4 lines
+  if [[ -f "$TEST_LOG" ]]; then
+    local lines
+    lines=$(wc -l < "$TEST_LOG" | tr -d ' ')
+    if [[ "$lines" -eq 4 ]]; then
+      pass "Log file has 4 entries (one per level)"
+    else
+      fail "Log entry count" "expected 4, got $lines"
+    fi
+  else
+    fail "Log file" "not created at $TEST_LOG"
+    return
+  fi
+
+  # Validate JSON structure of each line
+  local bad_json=false
+  while IFS= read -r line; do
+    if ! echo "$line" | ruby -rjson -e 'JSON.parse($stdin.read)' 2>/dev/null; then
+      bad_json=true
+      break
+    fi
+  done < "$TEST_LOG"
+  if [[ "$bad_json" == "false" ]]; then
+    pass "All log entries are valid JSON"
+  else
+    fail "JSON validity" "found invalid JSON line"
+  fi
+
+  # Check required fields
+  local missing_fields=false
+  while IFS= read -r line; do
+    local has_fields
+    has_fields=$(echo "$line" | ruby -rjson -e '
+      e = JSON.parse($stdin.read)
+      puts(%w[ts tool level msg pid].all? { |k| e.key?(k) } ? "ok" : "missing")
+    ')
+    if [[ "$has_fields" != "ok" ]]; then
+      missing_fields=true
+      break
+    fi
+  done < "$TEST_LOG"
+  if [[ "$missing_fields" == "false" ]]; then
+    pass "All entries have required fields (ts, tool, level, msg, pid)"
+  else
+    fail "Required fields" "entry missing required field"
+  fi
+
+  # Check ctx present when kwargs given
+  local ctx_check
+  ctx_check=$(ruby -rjson -e '
+    lines = File.readlines("'"$TEST_LOG"'").map { |l| JSON.parse(l) }
+    info = lines.find { |e| e["level"] == "info" }
+    error = lines.find { |e| e["level"] == "error" }
+    warn_entry = lines.find { |e| e["level"] == "warn" }
+    ok = info["ctx"] == {"key" => "val"} &&
+         error["ctx"] == {"code" => 1} &&
+         !warn_entry.key?("ctx")
+    puts ok ? "ok" : "fail"
+  ')
+  if [[ "$ctx_check" == "ok" ]]; then
+    pass "ctx field present when kwargs given, absent when not"
+  else
+    fail "ctx field" "unexpected ctx presence/absence"
+  fi
+}
+test_log_levels
+
+test_ts_format() {
+  local ts
+  ts=$(ruby -rjson -e '
+    e = JSON.parse(File.readlines("'"$TEST_LOG"'").first)
+    puts e["ts"]
+  ')
+  if [[ "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]]; then
+    pass "Timestamp is ISO 8601 UTC with milliseconds"
+  else
+    fail "Timestamp format" "got: $ts"
+  fi
+}
+test_ts_format
+
+# ---------------------------------------------------------------------------
+section "Fail-open"
+# ---------------------------------------------------------------------------
+
+test_fail_open() {
+  local output
+  output=$(ruby -e '
+    require "'"$SPILL_ROOT/lib/spill"'"
+    Spill.configure(tool: "test-fail", log: "/nonexistent/path/spill.jsonl")
+    Spill.error("should still reach stderr")
+  ' 2>&1)
+  if echo "$output" | grep -q "test-fail: should still reach stderr"; then
+    pass "Fail-open: stderr works when log path is unreachable"
+  else
+    fail "Fail-open" "stderr output missing"
+  fi
+}
+test_fail_open
+
+test_no_config() {
+  local output
+  output=$(ruby -e '
+    require "'"$SPILL_ROOT/lib/spill"'"
+    Spill.info("unconfigured message")
+  ' 2>&1)
+  if echo "$output" | grep -q "unknown: unconfigured message"; then
+    pass "Unconfigured tool defaults to 'unknown'"
+  else
+    fail "Unconfigured default" "expected 'unknown: ...', got: $output"
+  fi
+}
+test_no_config
+
+# ---------------------------------------------------------------------------
+section "Concurrent writes"
+# ---------------------------------------------------------------------------
+
+test_concurrent() {
+  local concurrent_log="$TMPDIR_TEST/concurrent.jsonl"
+  ruby -e '
+    require "'"$SPILL_ROOT/lib/spill"'"
+    pids = 5.times.map do |i|
+      fork do
+        Spill.configure(tool: "worker-#{i}", log: "'"$concurrent_log"'")
+        10.times { |j| Spill.info("msg #{j}") }
+      end
+    end
+    pids.each { |p| Process.wait(p) }
+  ' 2>/dev/null
+
+  if [[ -f "$concurrent_log" ]]; then
+    local lines
+    lines=$(wc -l < "$concurrent_log" | tr -d ' ')
+    if [[ "$lines" -eq 50 ]]; then
+      pass "Concurrent writes: 50 entries from 5 workers"
+    else
+      fail "Concurrent writes" "expected 50 lines, got $lines"
+    fi
+
+    # Verify each line is valid JSON
+    local bad=0
+    while IFS= read -r line; do
+      echo "$line" | ruby -rjson -e 'JSON.parse($stdin.read)' 2>/dev/null || ((bad++))
+    done < "$concurrent_log"
+    if [[ "$bad" -eq 0 ]]; then
+      pass "Concurrent writes: all entries are valid JSON"
+    else
+      fail "Concurrent JSON" "$bad invalid lines"
+    fi
+  else
+    fail "Concurrent writes" "log file not created"
+  fi
+}
+test_concurrent
+
+# ---------------------------------------------------------------------------
+section "CLI — bin/spill"
+# ---------------------------------------------------------------------------
+
+test_cli_tail() {
+  export SPILL_LOG="$TEST_LOG"
+  local output
+  output=$(ruby bin/spill tail --lines 2 2>/dev/null)
+  local count
+  count=$(echo "$output" | grep -c "test-tool")
+  if [[ "$count" -eq 2 ]]; then
+    pass "bin/spill tail --lines 2 shows 2 entries"
+  else
+    fail "bin/spill tail" "expected 2 entries, got $count"
+  fi
+}
+test_cli_tail
+
+test_cli_search_tool() {
+  export SPILL_LOG="$TEST_LOG"
+  local output
+  output=$(ruby bin/spill search --tool test-tool --level error 2>/dev/null)
+  if echo "$output" | grep -q "error message"; then
+    pass "bin/spill search --tool --level filters correctly"
+  else
+    fail "bin/spill search" "expected error message in output"
+  fi
+}
+test_cli_search_tool
+
+test_cli_search_msg() {
+  export SPILL_LOG="$TEST_LOG"
+  local output
+  output=$(ruby bin/spill search --msg "warn" 2>/dev/null)
+  if echo "$output" | grep -q "warn message"; then
+    pass "bin/spill search --msg filters by message content"
+  else
+    fail "bin/spill search --msg" "expected warn message in output"
+  fi
+}
+test_cli_search_msg
+
+test_cli_read() {
+  export SPILL_LOG="$TEST_LOG"
+  local output
+  output=$(ruby bin/spill read)
+  local lines
+  lines=$(echo "$output" | wc -l | tr -d ' ')
+  if [[ "$lines" -eq 4 ]]; then
+    pass "bin/spill read outputs raw JSONL"
+  else
+    fail "bin/spill read" "expected 4 lines, got $lines"
+  fi
+}
+test_cli_read
+
+test_cli_rotate() {
+  export SPILL_LOG="$TMPDIR_TEST/rotate-test.jsonl"
+  echo '{"ts":"2026-01-01T00:00:00.000Z","tool":"t","level":"info","msg":"old","pid":1}' > "$SPILL_LOG"
+  ruby bin/spill rotate 2>/dev/null
+  if [[ ! -f "$SPILL_LOG" ]] && ls "$TMPDIR_TEST"/rotate-test-*.jsonl >/dev/null 2>&1; then
+    pass "bin/spill rotate moves log to timestamped file"
+  else
+    fail "bin/spill rotate" "rotation did not work"
+  fi
+}
+test_cli_rotate
+
+# Clean up
+rm -rf "$TMPDIR_TEST"
+unset SPILL_LOG
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+printf "\n\033[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"
+printf "\033[1m%d passed\033[0m" "$passed"
+[[ $failed -gt 0 ]] && printf ", \033[31m%d failed\033[0m" "$failed"
+printf "\n"
+
+if [[ $failed -gt 0 ]]; then
+  printf "\n\033[31mFailing:\033[0m\n"
+  for f in "${failures[@]}"; do
+    printf "  • %s\n" "$f"
+  done
+  printf "\n"
+  exit 1
+fi
+
+exit 0

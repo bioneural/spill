@@ -1,0 +1,151 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# spill — structured log reader and management
+#
+# Reads and manages a centralized JSONL log.
+#
+# Subcommands:
+#   spill tail [--lines N]           Last N entries (default 20), formatted
+#   spill search --tool T            Filter by tool name
+#   spill search --level L           Filter by level
+#   spill search --since TIMESTAMP   Entries after timestamp
+#   spill search --msg PATTERN       Grep message field
+#   spill read                       Raw JSONL to stdout
+#   spill rotate [--keep N]          Rotate log, keep N old files (default 5)
+#
+# Usage:
+#   bin/spill tail
+#   bin/spill tail --lines 50
+#   bin/spill search --tool hooker --level error
+#   bin/spill search --since 2026-02-11T00:00:00Z
+#   bin/spill search --msg "sqlite3"
+#   bin/spill read
+#   bin/spill rotate
+#   bin/spill rotate --keep 3
+#
+# Environment:
+#   SPILL_LOG    Path to log file (default: .state/spill/spill.jsonl)
+#
+# Dependencies: ruby stdlib (json, fileutils)
+
+require 'json'
+require 'fileutils'
+
+LOG_PATH = ENV.fetch('SPILL_LOG') { File.join(Dir.pwd, '.state', 'spill', 'spill.jsonl') }
+
+LEVEL_COLORS = {
+  'error' => "\033[31m",
+  'warn'  => "\033[33m",
+  'info'  => "\033[32m",
+  'debug' => "\033[36m"
+}.freeze
+RESET = "\033[0m"
+
+def parse_flag(args, flag)
+  idx = args.index(flag)
+  return nil unless idx
+  args.delete_at(idx)
+  args.delete_at(idx)
+end
+
+def read_entries
+  return [] unless File.exist?(LOG_PATH)
+  File.readlines(LOG_PATH).map do |line|
+    next nil if line.strip.empty?
+    JSON.parse(line.strip)
+  rescue JSON::ParserError
+    nil
+  end.compact
+end
+
+def format_entry(entry)
+  ts = entry['ts']&.sub(/T/, ' ')&.sub(/Z$/, '')
+  level = entry['level'] || '?'
+  tool = entry['tool'] || '?'
+  msg = entry['msg'] || ''
+  color = LEVEL_COLORS[level] || ''
+  ctx = entry['ctx']
+  ctx_str = ctx && !ctx.empty? ? " #{ctx.inspect}" : ''
+  "#{ts} #{color}%-5s#{RESET} [#{tool}] #{msg}#{ctx_str}" % level
+end
+
+def cmd_tail(args)
+  n = (parse_flag(args, '--lines') || '20').to_i
+  entries = read_entries
+  entries.last(n).each { |e| puts format_entry(e) }
+end
+
+def cmd_search(args)
+  tool = parse_flag(args, '--tool')
+  level = parse_flag(args, '--level')
+  since = parse_flag(args, '--since')
+  pattern = parse_flag(args, '--msg')
+
+  entries = read_entries
+  entries.select! { |e| e['tool'] == tool } if tool
+  entries.select! { |e| e['level'] == level } if level
+  entries.select! { |e| e['ts'] >= since } if since
+  entries.select! { |e| e['msg']&.include?(pattern) } if pattern
+
+  entries.each { |e| puts format_entry(e) }
+  $stderr.puts "#{entries.length} entries" if entries.length > 0
+end
+
+def cmd_read
+  if File.exist?(LOG_PATH)
+    $stdout.write(File.read(LOG_PATH))
+  end
+end
+
+def cmd_rotate(args)
+  keep = (parse_flag(args, '--keep') || '5').to_i
+
+  unless File.exist?(LOG_PATH)
+    $stderr.puts 'spill: nothing to rotate'
+    return
+  end
+
+  dir = File.dirname(LOG_PATH)
+  base = File.basename(LOG_PATH, '.jsonl')
+  ts = Time.now.utc.strftime('%Y%m%d-%H%M%S')
+  rotated = File.join(dir, "#{base}-#{ts}.jsonl")
+
+  FileUtils.mv(LOG_PATH, rotated)
+  $stderr.puts "spill: rotated to #{File.basename(rotated)}"
+
+  # Clean old rotated files
+  old = Dir.glob(File.join(dir, "#{base}-*.jsonl")).sort
+  if old.length > keep
+    old[0...(old.length - keep)].each do |f|
+      File.delete(f)
+      $stderr.puts "spill: removed #{File.basename(f)}"
+    end
+  end
+end
+
+def usage
+  $stderr.puts <<~USAGE
+    Usage: spill <command> [options]
+
+    Commands:
+      tail [--lines N]             Last N entries (default 20), formatted
+      search [--tool T] [--level L] [--since TS] [--msg PAT]
+                                   Filter entries
+      read                         Raw JSONL to stdout
+      rotate [--keep N]            Rotate log, keep N old files (default 5)
+
+    Environment:
+      SPILL_LOG   Path to log file (default: .state/spill/spill.jsonl)
+  USAGE
+  exit 1
+end
+
+command = ARGV.shift
+case command
+when 'tail'   then cmd_tail(ARGV.dup)
+when 'search' then cmd_search(ARGV.dup)
+when 'read'   then cmd_read
+when 'rotate' then cmd_rotate(ARGV.dup)
+else usage
+end

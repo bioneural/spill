@@ -2,13 +2,13 @@
 
 # smoke-test — end-to-end verification of spill structured logging
 #
-# Tests the full cycle: write each level, verify JSONL structure,
+# Tests the full cycle: write each level, verify SQLite storage,
 # verify stderr output preserved, test concurrent writes, test CLI.
 #
 # Usage:
 #   test/smoke-test
 #
-# Dependencies: bash, ruby
+# Dependencies: bash, ruby, sqlite3
 #
 # Behavior:
 #   1. Runs each test in sequence
@@ -99,13 +99,13 @@ section "Logging"
 # ---------------------------------------------------------------------------
 
 TMPDIR_TEST=$(mktemp -d)
-TEST_LOG="$TMPDIR_TEST/spill.jsonl"
+TEST_DB="$TMPDIR_TEST/spill.db"
 
 test_log_levels() {
   local output
   output=$(ruby -e '
     require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "test-tool", log: "'"$TEST_LOG"'")
+    Spill.configure(tool: "test-tool", db: "'"$TEST_DB"'")
     Spill.info("info message", key: "val")
     Spill.warn("warn message")
     Spill.error("error message", code: 1)
@@ -122,63 +122,62 @@ test_log_levels() {
     fail "stderr format" "expected 'test-tool: <msg>' for each level, got: $output"
   fi
 
-  # Check JSONL file has 4 lines
-  if [[ -f "$TEST_LOG" ]]; then
-    local lines
-    lines=$(wc -l < "$TEST_LOG" | tr -d ' ')
-    if [[ "$lines" -eq 4 ]]; then
-      pass "Log file has 4 entries (one per level)"
+  # Check database has 4 entries
+  if [[ -f "$TEST_DB" ]]; then
+    local count
+    count=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM log;" 2>/dev/null)
+    if [[ "$count" -eq 4 ]]; then
+      pass "Database has 4 entries (one per level)"
     else
-      fail "Log entry count" "expected 4, got $lines"
+      fail "Entry count" "expected 4, got $count"
     fi
   else
-    fail "Log file" "not created at $TEST_LOG"
+    fail "Database" "not created at $TEST_DB"
     return
   fi
 
-  # Validate JSON structure of each line
-  local bad_json=false
-  while IFS= read -r line; do
-    if ! echo "$line" | ruby -rjson -e 'JSON.parse($stdin.read)' 2>/dev/null; then
-      bad_json=true
-      break
-    fi
-  done < "$TEST_LOG"
-  if [[ "$bad_json" == "false" ]]; then
-    pass "All log entries are valid JSON"
+  # Check schema has expected columns
+  local cols
+  cols=$(sqlite3 "$TEST_DB" "PRAGMA table_info(log);" 2>/dev/null | cut -d'|' -f2 | tr '\n' ',')
+  if [[ "$cols" == *"ts,"*"tool,"*"level,"*"msg,"*"pid,"*"ctx,"* ]]; then
+    pass "Schema has all expected columns"
   else
-    fail "JSON validity" "found invalid JSON line"
+    fail "Schema" "columns: $cols"
   fi
 
-  # Check required fields
-  local missing_fields=false
-  while IFS= read -r line; do
-    local has_fields
-    has_fields=$(echo "$line" | ruby -rjson -e '
-      e = JSON.parse($stdin.read)
-      puts(%w[ts tool level msg pid].all? { |k| e.key?(k) } ? "ok" : "missing")
-    ')
-    if [[ "$has_fields" != "ok" ]]; then
-      missing_fields=true
-      break
-    fi
-  done < "$TEST_LOG"
-  if [[ "$missing_fields" == "false" ]]; then
-    pass "All entries have required fields (ts, tool, level, msg, pid)"
+  # Check indexes exist
+  local idx_count
+  idx_count=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='log';" 2>/dev/null)
+  if [[ "$idx_count" -ge 4 ]]; then
+    pass "All indexes present (found $idx_count)"
   else
-    fail "Required fields" "entry missing required field"
+    fail "Indexes" "expected >= 4, found $idx_count"
   fi
 
-  # Check ctx present when kwargs given
+  # Check required fields are populated
+  local null_check
+  null_check=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM log WHERE ts IS NULL OR tool IS NULL OR level IS NULL OR msg IS NULL OR pid IS NULL;" 2>/dev/null)
+  if [[ "$null_check" -eq 0 ]]; then
+    pass "All entries have required fields populated"
+  else
+    fail "Required fields" "$null_check entries with NULL required fields"
+  fi
+
+  # Check ctx present when kwargs given, absent when not
   local ctx_check
   ctx_check=$(ruby -rjson -e '
-    lines = File.readlines("'"$TEST_LOG"'").map { |l| JSON.parse(l) }
-    info = lines.find { |e| e["level"] == "info" }
-    error = lines.find { |e| e["level"] == "error" }
-    warn_entry = lines.find { |e| e["level"] == "warn" }
-    ok = info["ctx"] == {"key" => "val"} &&
-         error["ctx"] == {"code" => 1} &&
-         !warn_entry.key?("ctx")
+    require "open3"
+    out, = Open3.capture2("sqlite3", "-json", "'"$TEST_DB"'",
+      stdin_data: "SELECT level, ctx FROM log;", err: File::NULL)
+    rows = JSON.parse(out)
+    info = rows.find { |r| r["level"] == "info" }
+    error = rows.find { |r| r["level"] == "error" }
+    warn_entry = rows.find { |r| r["level"] == "warn" }
+    info_ctx = JSON.parse(info["ctx"])
+    error_ctx = JSON.parse(error["ctx"])
+    ok = info_ctx == {"key" => "val"} &&
+         error_ctx == {"code" => 1} &&
+         (warn_entry["ctx"].nil? || warn_entry["ctx"].to_s.empty?)
     puts ok ? "ok" : "fail"
   ')
   if [[ "$ctx_check" == "ok" ]]; then
@@ -191,10 +190,7 @@ test_log_levels
 
 test_ts_format() {
   local ts
-  ts=$(ruby -rjson -e '
-    e = JSON.parse(File.readlines("'"$TEST_LOG"'").first)
-    puts e["ts"]
-  ')
+  ts=$(sqlite3 "$TEST_DB" "SELECT ts FROM log LIMIT 1;" 2>/dev/null)
   if [[ "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]]; then
     pass "Timestamp is ISO 8601 UTC with milliseconds"
   else
@@ -202,6 +198,17 @@ test_ts_format() {
   fi
 }
 test_ts_format
+
+test_wal_mode() {
+  local mode
+  mode=$(sqlite3 "$TEST_DB" "PRAGMA journal_mode;" 2>/dev/null)
+  if [[ "$mode" == "wal" ]]; then
+    pass "Database uses WAL journal mode"
+  else
+    fail "Journal mode" "expected wal, got $mode"
+  fi
+}
+test_wal_mode
 
 # ---------------------------------------------------------------------------
 section "Fail-open"
@@ -211,11 +218,11 @@ test_fail_open() {
   local output
   output=$(ruby -e '
     require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "test-fail", log: "/nonexistent/path/spill.jsonl")
+    Spill.configure(tool: "test-fail", db: "/nonexistent/path/spill.db")
     Spill.error("should still reach stderr")
   ' 2>&1)
   if echo "$output" | grep -q "test-fail: should still reach stderr"; then
-    pass "Fail-open: stderr works when log path is unreachable"
+    pass "Fail-open: stderr works when database path is unreachable"
   else
     fail "Fail-open" "stderr output missing"
   fi
@@ -241,39 +248,37 @@ section "Concurrent writes"
 # ---------------------------------------------------------------------------
 
 test_concurrent() {
-  local concurrent_log="$TMPDIR_TEST/concurrent.jsonl"
+  local concurrent_db="$TMPDIR_TEST/concurrent.db"
   ruby -e '
     require "'"$SPILL_ROOT/lib/spill"'"
     pids = 5.times.map do |i|
       fork do
-        Spill.configure(tool: "worker-#{i}", log: "'"$concurrent_log"'")
+        Spill.configure(tool: "worker-#{i}", db: "'"$concurrent_db"'")
         10.times { |j| Spill.info("msg #{j}") }
       end
     end
     pids.each { |p| Process.wait(p) }
   ' 2>/dev/null
 
-  if [[ -f "$concurrent_log" ]]; then
-    local lines
-    lines=$(wc -l < "$concurrent_log" | tr -d ' ')
-    if [[ "$lines" -eq 50 ]]; then
+  if [[ -f "$concurrent_db" ]]; then
+    local count
+    count=$(sqlite3 "$concurrent_db" "SELECT COUNT(*) FROM log;" 2>/dev/null)
+    if [[ "$count" -eq 50 ]]; then
       pass "Concurrent writes: 50 entries from 5 workers"
     else
-      fail "Concurrent writes" "expected 50 lines, got $lines"
+      fail "Concurrent writes" "expected 50 entries, got $count"
     fi
 
-    # Verify each line is valid JSON
-    local bad=0
-    while IFS= read -r line; do
-      echo "$line" | ruby -rjson -e 'JSON.parse($stdin.read)' 2>/dev/null || ((bad++))
-    done < "$concurrent_log"
+    # Verify entries have valid data
+    local bad
+    bad=$(sqlite3 "$concurrent_db" "SELECT COUNT(*) FROM log WHERE ts IS NULL OR tool IS NULL OR msg IS NULL;" 2>/dev/null)
     if [[ "$bad" -eq 0 ]]; then
-      pass "Concurrent writes: all entries are valid JSON"
+      pass "Concurrent writes: all entries have valid data"
     else
-      fail "Concurrent JSON" "$bad invalid lines"
+      fail "Concurrent data" "$bad entries with NULL fields"
     fi
   else
-    fail "Concurrent writes" "log file not created"
+    fail "Concurrent writes" "database not created"
   fi
 }
 test_concurrent
@@ -283,7 +288,7 @@ section "CLI — bin/spill"
 # ---------------------------------------------------------------------------
 
 test_cli_tail() {
-  export SPILL_LOG="$TEST_LOG"
+  export SPILL_DB="$TEST_DB"
   local output
   output=$(ruby bin/spill tail --lines 2 2>/dev/null)
   local count
@@ -297,7 +302,7 @@ test_cli_tail() {
 test_cli_tail
 
 test_cli_search_tool() {
-  export SPILL_LOG="$TEST_LOG"
+  export SPILL_DB="$TEST_DB"
   local output
   output=$(ruby bin/spill search --tool test-tool --level error 2>/dev/null)
   if echo "$output" | grep -q "error message"; then
@@ -309,7 +314,7 @@ test_cli_search_tool() {
 test_cli_search_tool
 
 test_cli_search_msg() {
-  export SPILL_LOG="$TEST_LOG"
+  export SPILL_DB="$TEST_DB"
   local output
   output=$(ruby bin/spill search --msg "warn" 2>/dev/null)
   if echo "$output" | grep -q "warn message"; then
@@ -321,118 +326,103 @@ test_cli_search_msg() {
 test_cli_search_msg
 
 test_cli_read() {
-  export SPILL_LOG="$TEST_LOG"
+  export SPILL_DB="$TEST_DB"
   local output
   output=$(ruby bin/spill read)
   local lines
   lines=$(echo "$output" | wc -l | tr -d ' ')
   if [[ "$lines" -eq 4 ]]; then
-    pass "bin/spill read outputs raw JSONL"
+    pass "bin/spill read outputs 4 JSONL lines"
   else
     fail "bin/spill read" "expected 4 lines, got $lines"
+  fi
+
+  # Verify each line is valid JSON
+  local bad_json=0
+  while IFS= read -r line; do
+    echo "$line" | ruby -rjson -e 'JSON.parse($stdin.read)' 2>/dev/null || ((bad_json++))
+  done <<< "$output"
+  if [[ "$bad_json" -eq 0 ]]; then
+    pass "bin/spill read outputs valid JSON per line"
+  else
+    fail "bin/spill read JSON" "$bad_json invalid lines"
   fi
 }
 test_cli_read
 
-test_cli_rotate() {
-  export SPILL_LOG="$TMPDIR_TEST/rotate-test.jsonl"
-  echo '{"ts":"2026-01-01T00:00:00.000Z","tool":"t","level":"info","msg":"old","pid":1}' > "$SPILL_LOG"
-  ruby bin/spill rotate 2>/dev/null
-  if [[ ! -f "$SPILL_LOG" ]] && ls "$TMPDIR_TEST"/rotate-test-*.jsonl >/dev/null 2>&1; then
-    pass "bin/spill rotate moves log to timestamped file"
-  else
-    fail "bin/spill rotate" "rotation did not work"
-  fi
-}
-test_cli_rotate
-
-# ---------------------------------------------------------------------------
-section "Auto-rotation"
-# ---------------------------------------------------------------------------
-
-test_auto_rotate() {
-  local rot_dir="$TMPDIR_TEST/auto-rotate"
-  mkdir -p "$rot_dir"
-  local rot_log="$rot_dir/spill.jsonl"
-
-  # Write enough data to exceed a 500-byte threshold
+test_cli_cull() {
+  export SPILL_DB="$TMPDIR_TEST/cull-cli.db"
   ruby -e '
     require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "rot-test", log: "'"$rot_log"'", max_size: 500)
-    20.times { |i| Spill.info("message number #{i} with padding to increase line size") }
+    Spill.configure(tool: "cull-test", db: "'"$TMPDIR_TEST/cull-cli.db"'")
+    10.times { |i| Spill.info("entry #{i}") }
   ' 2>/dev/null
 
-  local rotated_count
-  rotated_count=$(ls "$rot_dir"/spill-*.jsonl 2>/dev/null | wc -l | tr -d ' ')
-  if [[ "$rotated_count" -gt 0 ]]; then
-    pass "Auto-rotation triggers when log exceeds max_size"
-  else
-    fail "Auto-rotation" "no rotated files found (expected at least 1)"
-  fi
+  local before
+  before=$(sqlite3 "$SPILL_DB" "SELECT COUNT(*) FROM log;" 2>/dev/null)
+  ruby bin/spill cull 2>/dev/null
+  local after
+  after=$(sqlite3 "$SPILL_DB" "SELECT COUNT(*) FROM log;" 2>/dev/null)
 
-  # Current log should exist and be under the threshold
-  if [[ -f "$rot_log" ]]; then
-    local current_size
-    current_size=$(wc -c < "$rot_log" | tr -d ' ')
-    if [[ "$current_size" -lt 500 ]]; then
-      pass "Current log is under max_size after rotation"
-    else
-      fail "Post-rotation size" "current log is $current_size bytes, expected < 500"
-    fi
+  if [[ "$after" -eq 5 ]] && [[ "$before" -eq 10 ]]; then
+    pass "bin/spill cull removes oldest 50% of entries"
   else
-    # Exactly at rotation boundary — log was rotated, no new writes. Acceptable.
-    pass "Current log is under max_size after rotation"
+    fail "bin/spill cull" "expected 10 -> 5, got $before -> $after"
   fi
 }
-test_auto_rotate
+test_cli_cull
+
+# ---------------------------------------------------------------------------
+section "Auto-culling"
+# ---------------------------------------------------------------------------
 
 test_auto_cull() {
-  local cull_dir="$TMPDIR_TEST/auto-cull"
-  mkdir -p "$cull_dir"
-  local cull_log="$cull_dir/spill.jsonl"
+  local cull_db="$TMPDIR_TEST/auto-cull.db"
 
-  # max_size=200, keep=2: should rotate frequently, cull down to 2 old files
+  # max_size=8192 (8 KB): should trigger culling after enough writes
   ruby -e '
     require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "cull-test", log: "'"$cull_log"'", max_size: 200, keep: 2)
-    50.times { |i| Spill.info("cull message #{i} with extra padding text here") }
+    Spill.configure(tool: "cull-test", db: "'"$cull_db"'", max_size: 8192)
+    200.times { |i| Spill.info("auto-cull message number #{i} with padding to increase row size significantly") }
   ' 2>/dev/null
 
-  local rotated_count
-  rotated_count=$(ls "$cull_dir"/spill-*.jsonl 2>/dev/null | wc -l | tr -d ' ')
-  if [[ "$rotated_count" -le 2 ]]; then
-    pass "Culling keeps at most 2 rotated files (found $rotated_count)"
+  if [[ -f "$cull_db" ]]; then
+    local count
+    count=$(sqlite3 "$cull_db" "SELECT COUNT(*) FROM log;" 2>/dev/null)
+    if [[ "$count" -lt 200 ]]; then
+      pass "Auto-culling reduced entries (${count} < 200)"
+    else
+      fail "Auto-culling" "expected fewer than 200 entries, got $count"
+    fi
   else
-    fail "Culling" "expected <= 2 rotated files, found $rotated_count"
+    fail "Auto-culling" "database not created"
   fi
 }
 test_auto_cull
 
-test_rotation_disabled() {
-  local nodis_dir="$TMPDIR_TEST/no-rotate"
-  mkdir -p "$nodis_dir"
-  local nodis_log="$nodis_dir/spill.jsonl"
+test_cull_disabled() {
+  local nodis_db="$TMPDIR_TEST/no-cull.db"
 
-  # max_size=0 disables auto-rotation
+  # max_size=0 disables auto-culling
   ruby -e '
     require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "no-rot", log: "'"$nodis_log"'", max_size: 0)
-    20.times { |i| Spill.info("no rotate #{i}") }
+    Spill.configure(tool: "no-cull", db: "'"$nodis_db"'", max_size: 0)
+    20.times { |i| Spill.info("no cull #{i}") }
   ' 2>/dev/null
 
-  local rotated_count
-  rotated_count=$(ls "$nodis_dir"/spill-*.jsonl 2>/dev/null | wc -l | tr -d ' ')
-  if [[ "$rotated_count" -eq 0 ]]; then
-    pass "Auto-rotation disabled when max_size is 0"
+  local count
+  count=$(sqlite3 "$nodis_db" "SELECT COUNT(*) FROM log;" 2>/dev/null)
+  if [[ "$count" -eq 20 ]]; then
+    pass "Auto-culling disabled when max_size is 0"
   else
-    fail "Rotation disabled" "expected 0 rotated files, found $rotated_count"
+    fail "Culling disabled" "expected 20 entries, got $count"
   fi
 }
-test_rotation_disabled
+test_cull_disabled
 
 # Clean up
 rm -rf "$TMPDIR_TEST"
-unset SPILL_LOG
+unset SPILL_DB
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -6,9 +6,9 @@
 
 Seven tools write diagnostic output to stderr. Free-form text. No timestamps, no levels, no queryable structure. When something breaks at 3 AM, the only option is grep across scattered streams and hope the right line surfaces.
 
-Spill replaces hope with structure. Every diagnostic message becomes a JSON line — timestamped, leveled, tagged by source tool — while the original stderr output is preserved unchanged. One log file. One place to look.
+Spill replaces hope with structure. Every diagnostic message becomes a row in a SQLite database — timestamped, leveled, tagged by source tool, indexed for queries — while the original stderr output is preserved unchanged. One database. One place to look.
 
-A single module. No gems. No external dependencies. Ruby stdlib only.
+A single module. No gems. No external dependencies. Ruby stdlib and sqlite3 only.
 
 ---
 
@@ -23,11 +23,7 @@ Spill.error("sqlite3 error: #{msg}", command: 'sqlite3')
 
 Each call does two things:
 1. Writes `crib: stored entry #42` to stderr (unchanged from before)
-2. Appends one JSON line to `.state/spill/spill.jsonl`
-
-```json
-{"ts":"2026-02-11T14:32:07.123Z","tool":"crib","level":"info","msg":"stored entry #42","pid":48291,"ctx":{"entry_id":42}}
-```
+2. INSERTs a row into `.state/spill/spill.db`
 
 If spill is not installed, tools fall back to plain stderr output. Nothing breaks.
 
@@ -35,24 +31,41 @@ If spill is not installed, tools fall back to plain stderr output. Nothing break
 
 ## Schema
 
-Every log entry is a single JSON object on one line (JSON Lines format).
+A single table with indexes for the most common query patterns.
 
-| Field | Type | Required | Purpose |
-|-------|------|----------|---------|
-| `ts` | string | yes | ISO 8601 UTC with milliseconds (`2026-02-11T14:32:07.123Z`) |
-| `tool` | string | yes | Source tool: `lay`, `crib`, `hooker`, `book`, `trick`, `classify`, `heartbeat`, `init` |
-| `level` | string | yes | `debug`, `info`, `warn`, `error` |
-| `msg` | string | yes | Human-readable diagnostic text |
-| `pid` | integer | yes | Process ID — disambiguates concurrent writers |
-| `ctx` | object | no | Structured context: `{"exit_code": 1}`, `{"entry_id": 42}`, etc. |
+```sql
+CREATE TABLE log (
+  id    INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts    TEXT NOT NULL,       -- ISO 8601 UTC with milliseconds
+  tool  TEXT NOT NULL,       -- source tool name
+  level TEXT NOT NULL,       -- debug, info, warn, error
+  msg   TEXT NOT NULL,       -- human-readable diagnostic text
+  pid   INTEGER NOT NULL,    -- process ID
+  ctx   TEXT                 -- JSON context, NULL when empty
+);
+
+CREATE INDEX idx_log_ts    ON log(ts);
+CREATE INDEX idx_log_tool  ON log(tool);
+CREATE INDEX idx_log_level ON log(level);
+CREATE INDEX idx_log_tool_level ON log(tool, level);
+```
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `ts` | TEXT | `2026-02-11T14:32:07.123Z` |
+| `tool` | TEXT | `lay`, `crib`, `hooker`, `book`, `trick`, `classify`, `heartbeat`, `init` |
+| `level` | TEXT | `debug`, `info`, `warn`, `error` |
+| `msg` | TEXT | Diagnostic text |
+| `pid` | INTEGER | Disambiguates concurrent writers |
+| `ctx` | TEXT | JSON object or NULL: `{"exit_code": 1}`, `{"entry_id": 42}` |
 
 ### Levels
 
 | Level | When to use | Examples |
 |-------|-------------|---------|
-| `error` | Something broke | `sqlite3 error: table not found`, `ollama failed`, `classification failed` |
-| `warn` | Degraded operation | `ollama not found`, `classify not found`, `context file not found` |
-| `info` | Operational status | `stored entry #42`, `processing 5 turns`, `initialized crib.db` |
+| `error` | Something broke | `sqlite3 error: table not found`, `ollama failed` |
+| `warn` | Degraded operation | `ollama not found`, `context file not found` |
+| `info` | Operational status | `stored entry #42`, `processing 5 turns` |
 | `debug` | Tracing detail | Reserved for future use |
 
 ---
@@ -84,16 +97,13 @@ bin/spill search --tool crib --level error --msg "sqlite3"
 # Raw JSONL to stdout (pipe to jq, etc.)
 bin/spill read
 
-# Rotate the log file, keep 5 old copies (default)
-bin/spill rotate
-
-# Rotate, keep 3
-bin/spill rotate --keep 3
+# Delete oldest 50% of entries and vacuum
+bin/spill cull
 ```
 
 Tail and search output is colorized by level: red for error, yellow for warn, green for info, cyan for debug. Each line shows timestamp, level, tool name, message, and any context fields.
 
-Rotate moves the current log to a timestamped file (`spill-20260211-143207.jsonl`) and removes old rotated files beyond the keep count.
+The `read` command outputs one JSON object per line (JSONL format) for piping to external tools.
 
 ---
 
@@ -125,18 +135,34 @@ The guard pattern (`defined?(Spill) ? ... : ...`) ensures tools work identically
 
 ### hooker (inline)
 
-Hooker cannot require external files, so a spill function is defined inline with the same schema and atomic append behavior:
+Hooker cannot require external files, so a spill function is defined inline. It writes directly to the SQLite database via the sqlite3 CLI:
 
 ```ruby
-SPILL_LOG = ENV['SPILL_LOG'] || File.join(Dir.pwd, '.state', 'spill', 'spill.jsonl')
+SPILL_DB = ENV['SPILL_DB'] || File.join(Dir.pwd, '.state', 'spill', 'spill.db')
+@spill_db_ready = false
 
 def spill(level, msg, **ctx)
   $stderr.puts "hooker: #{msg}"
-  entry = { ts: Time.now.utc.strftime('%Y-%m-%dT%H:%M:%S.%3NZ'),
-            tool: 'hooker', level: level, msg: msg, pid: Process.pid }
-  entry[:ctx] = ctx unless ctx.empty?
-  FileUtils.mkdir_p(File.dirname(SPILL_LOG)) unless File.directory?(File.dirname(SPILL_LOG))
-  File.open(SPILL_LOG, 'a') { |f| f.write(JSON.generate(entry) + "\n") }
+  unless @spill_db_ready
+    # Create table on first call
+    Open3.capture2('sqlite3', SPILL_DB, stdin_data: <<~SQL, err: File::NULL)
+      PRAGMA busy_timeout = 5000;
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+        tool TEXT NOT NULL, level TEXT NOT NULL, msg TEXT NOT NULL,
+        pid INTEGER NOT NULL, ctx TEXT
+      );
+    SQL
+    @spill_db_ready = true
+  end
+  ts = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%S.%3NZ')
+  escaped = msg.gsub("'", "''")
+  ctx_sql = ctx.empty? ? 'NULL' : "'#{JSON.generate(ctx).gsub("'", "''")}'"
+  Open3.capture2('sqlite3', SPILL_DB, stdin_data:
+    "PRAGMA busy_timeout = 5000; INSERT INTO log (ts,tool,level,msg,pid,ctx) " \
+    "VALUES ('#{ts}','hooker','#{level}','#{escaped}',#{Process.pid},#{ctx_sql});",
+    err: File::NULL)
 rescue
   nil
 end
@@ -144,16 +170,27 @@ end
 
 ### heartbeat (bash)
 
-A bash function implements the same protocol:
+A bash function writes directly to the SQLite database:
 
 ```bash
+SPILL_DB="${SPILL_DB:-.state/spill/spill.db}"
+
 spill() {
   local level="$1" msg="$2"
   echo "heartbeat: $msg" >&2
-  local log="${SPILL_LOG:-.state/spill/spill.jsonl}"
-  mkdir -p "$(dirname "$log")" 2>/dev/null
-  printf '{"ts":"%s","tool":"heartbeat","level":"%s","msg":"%s","pid":%d}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$level" "$msg" "$$" >> "$log" 2>/dev/null || true
+  mkdir -p "$(dirname "$SPILL_DB")" 2>/dev/null
+  if [[ ! -f "$SPILL_DB" ]]; then
+    sqlite3 "$SPILL_DB" "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; \
+      CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+      ts TEXT NOT NULL, tool TEXT NOT NULL, level TEXT NOT NULL, \
+      msg TEXT NOT NULL, pid INTEGER NOT NULL, ctx TEXT);" 2>/dev/null || true
+  fi
+  local ts escaped_msg
+  ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  escaped_msg="${msg//\'/\'\'}"
+  sqlite3 "$SPILL_DB" "PRAGMA busy_timeout=5000; INSERT INTO log \
+    (ts,tool,level,msg,pid,ctx) VALUES \
+    ('$ts','heartbeat','$level','$escaped_msg',$$,NULL);" 2>/dev/null || true
 }
 ```
 
@@ -161,28 +198,23 @@ spill() {
 
 ## Design
 
-**Stderr preserved.** Every `Spill.error("msg")` call writes `tool: msg` to stderr before touching the log file. Claude Code hooks that read stderr continue to work. The structured log is additive — it never replaces the existing output path.
+**Stderr preserved.** Every `Spill.error("msg")` call writes `tool: msg` to stderr before touching the database. Claude Code hooks that read stderr continue to work. The structured log is additive — it never replaces the existing output path.
 
-**Open-per-write.** Each log call opens the file, appends, and closes. No held file descriptor. Safe after log rotation. Safe for concurrent processes that share the same log path.
+**SQLite storage.** Entries are rows in a WAL-mode SQLite database, not lines in a flat file. This enables indexed queries by tool, level, timestamp, and message content without reading the entire log. The database handles concurrent writes natively — WAL mode with a 5-second busy timeout ensures multiple processes can log simultaneously without data loss.
 
-**POSIX atomic append.** `File.open(path, 'a')` uses `O_APPEND`. Single writes under PIPE_BUF (4096 bytes) are atomic — concurrent writers don't interleave partial lines. A JSON log entry is well under this limit.
+**Fail-open.** If the database can't be written (permissions, full disk, missing sqlite3), the tool continues. Stderr already has the message. A logging failure never becomes a tool failure.
 
-**Fail-open.** If the log file can't be written (permissions, full disk, missing directory after manual deletion), the tool continues. Stderr already has the message. A logging failure never becomes a tool failure.
+**Auto-culling.** When a database exceeds `max_size` (default 10 MB), the next write deletes the oldest 50% of entries and runs VACUUM to reclaim space. Total disk usage stays bounded. With defaults, the database holds roughly 50,000–100,000 entries — months of diagnostic history. Set `max_size` to `0` to disable auto-culling entirely.
 
-**Single destination.** All tools write to the same file: `.state/spill/spill.jsonl` in the working directory. One file to tail, search, rotate, and eventually feed to an agent for health monitoring.
-
-**Auto-rotation.** When a log file exceeds `max_size` (default 1 MB), the next write renames it to a timestamped file (`spill-20260211-143207.jsonl`) and starts fresh. Old rotated files beyond the `keep` count (default 5) are deleted. Total disk usage stays bounded at roughly `(keep + 1) * max_size` — 6 MB with defaults. Rotation is size-based, not date-based. A log that never hits 1 MB never rotates.
-
-Rotation is fail-open and race-safe. If two processes detect the threshold simultaneously, one rename succeeds and the other is silently rescued. The next write from either process creates a fresh log file.
+**Single destination.** All tools write to the same database: `.state/spill/spill.db` in the working directory. One file to query, cull, and eventually feed to an agent for health monitoring.
 
 ### Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SPILL_LOG` | `.state/spill/spill.jsonl` | Path to the log file |
+| `SPILL_DB` | `.state/spill/spill.db` | Path to the database file |
 | `SPILL_HOME` | `../../spill` (sibling directory) | Path to the spill repo (for `require`) |
-| `SPILL_MAX_SIZE` | `1048576` (1 MB) | Rotate when log exceeds this size in bytes. Set to `0` to disable auto-rotation. |
-| `SPILL_KEEP` | `5` | Number of rotated files to keep. Older files are deleted. |
+| `SPILL_MAX_SIZE` | `10485760` (10 MB) | Cull when database exceeds this size in bytes. Set to `0` to disable. |
 
 ---
 
@@ -200,35 +232,36 @@ Syntax
 
 Logging
   ✓ stderr output preserves tool: msg format
-  ✓ Log file has 4 entries (one per level)
-  ✓ All log entries are valid JSON
-  ✓ All entries have required fields (ts, tool, level, msg, pid)
+  ✓ Database has 4 entries (one per level)
+  ✓ Schema has all expected columns
+  ✓ All indexes present (found 4)
+  ✓ All entries have required fields populated
   ✓ ctx field present when kwargs given, absent when not
   ✓ Timestamp is ISO 8601 UTC with milliseconds
+  ✓ Database uses WAL journal mode
 
 Fail-open
-  ✓ Fail-open: stderr works when log path is unreachable
+  ✓ Fail-open: stderr works when database path is unreachable
   ✓ Unconfigured tool defaults to 'unknown'
 
 Concurrent writes
   ✓ Concurrent writes: 50 entries from 5 workers
-  ✓ Concurrent writes: all entries are valid JSON
+  ✓ Concurrent writes: all entries have valid data
 
 CLI — bin/spill
   ✓ bin/spill tail --lines 2 shows 2 entries
   ✓ bin/spill search --tool --level filters correctly
   ✓ bin/spill search --msg filters by message content
-  ✓ bin/spill read outputs raw JSONL
-  ✓ bin/spill rotate moves log to timestamped file
+  ✓ bin/spill read outputs 4 JSONL lines
+  ✓ bin/spill read outputs valid JSON per line
+  ✓ bin/spill cull removes oldest 50% of entries
 
-Auto-rotation
-  ✓ Auto-rotation triggers when log exceeds max_size
-  ✓ Current log is under max_size after rotation
-  ✓ Culling keeps at most 2 rotated files
-  ✓ Auto-rotation disabled when max_size is 0
+Auto-culling
+  ✓ Auto-culling reduced entries
+  ✓ Auto-culling disabled when max_size is 0
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-22 passed
+23 passed
 ```
 
 Tests run against a temporary directory that is created and destroyed on each run. No artifacts are left behind.
@@ -238,6 +271,7 @@ Tests run against a temporary directory that is created and destroyed on each ru
 ## Prerequisites
 
 - Ruby 3.x
+- sqlite3 CLI
 
 ---
 

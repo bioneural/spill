@@ -3,7 +3,7 @@
 
 # spill — structured log reader and management tool
 #
-# Reads and manages a centralized JSONL log.
+# Reads and manages a centralized SQLite log database.
 #
 # Subcommands:
 #   spill tail [--lines N]           Last N entries (default 20), formatted
@@ -12,7 +12,7 @@
 #   spill search --since TIMESTAMP   Entries after timestamp
 #   spill search --msg PATTERN       Grep message field
 #   spill read                       Raw JSONL to stdout
-#   spill rotate [--keep N]          Rotate log, keep N old files (default 5)
+#   spill cull                       Delete oldest 50% of entries
 #
 # Usage:
 #   bin/spill tail
@@ -21,18 +21,17 @@
 #   bin/spill search --since 2026-02-11T00:00:00Z
 #   bin/spill search --msg "sqlite3"
 #   bin/spill read
-#   bin/spill rotate
-#   bin/spill rotate --keep 3
+#   bin/spill cull
 #
 # Environment:
-#   SPILL_LOG    Path to log file (default: .state/spill/spill.jsonl)
+#   SPILL_DB    Path to database (default: .state/spill/spill.db)
 #
-# Dependencies: ruby stdlib (json, fileutils)
+# Dependencies: ruby stdlib (json, open3), sqlite3 CLI
 
 require 'json'
-require 'fileutils'
+require 'open3'
 
-LOG_PATH = ENV.fetch('SPILL_LOG') { File.join(Dir.pwd, '.state', 'spill', 'spill.jsonl') }
+DB_PATH = ENV.fetch('SPILL_DB') { File.join(Dir.pwd, '.state', 'spill', 'spill.db') }
 
 LEVEL_COLORS = {
   'error' => "\033[31m",
@@ -49,14 +48,17 @@ def parse_flag(args, flag)
   args.delete_at(idx)
 end
 
-def read_entries
-  return [] unless File.exist?(LOG_PATH)
-  File.readlines(LOG_PATH).map do |line|
-    next nil if line.strip.empty?
-    JSON.parse(line.strip)
-  rescue JSON::ParserError
-    nil
-  end.compact
+def esc(str)
+  str.to_s.gsub("'", "''")
+end
+
+def sql_query(sql)
+  return [] unless File.exist?(DB_PATH)
+  stdout, = Open3.capture2('sqlite3', '-json', DB_PATH, stdin_data: sql, err: File::NULL)
+  return [] if stdout.strip.empty?
+  JSON.parse(stdout)
+rescue
+  []
 end
 
 def format_entry(entry)
@@ -66,14 +68,17 @@ def format_entry(entry)
   msg = entry['msg'] || ''
   color = LEVEL_COLORS[level] || ''
   ctx = entry['ctx']
-  ctx_str = ctx && !ctx.empty? ? " #{ctx.inspect}" : ''
+  if ctx.is_a?(String) && !ctx.empty?
+    ctx = JSON.parse(ctx) rescue ctx
+  end
+  ctx_str = ctx.is_a?(Hash) && !ctx.empty? ? " #{ctx.inspect}" : ''
   "#{ts} #{color}%-5s#{RESET} [#{tool}] #{msg}#{ctx_str}" % level
 end
 
 def cmd_tail(args)
   n = (parse_flag(args, '--lines') || '20').to_i
-  entries = read_entries
-  entries.last(n).each { |e| puts format_entry(e) }
+  entries = sql_query("SELECT * FROM log ORDER BY id DESC LIMIT #{n};")
+  entries.reverse.each { |e| puts format_entry(e) }
 end
 
 def cmd_search(args)
@@ -82,46 +87,53 @@ def cmd_search(args)
   since = parse_flag(args, '--since')
   pattern = parse_flag(args, '--msg')
 
-  entries = read_entries
-  entries.select! { |e| e['tool'] == tool } if tool
-  entries.select! { |e| e['level'] == level } if level
-  entries.select! { |e| e['ts'] >= since } if since
-  entries.select! { |e| e['msg']&.include?(pattern) } if pattern
+  conditions = []
+  conditions << "tool = '#{esc(tool)}'" if tool
+  conditions << "level = '#{esc(level)}'" if level
+  conditions << "ts >= '#{esc(since)}'" if since
+  conditions << "msg LIKE '%#{esc(pattern)}%'" if pattern
+
+  where = conditions.empty? ? '' : "WHERE #{conditions.join(' AND ')}"
+  entries = sql_query("SELECT * FROM log #{where} ORDER BY id ASC;")
 
   entries.each { |e| puts format_entry(e) }
   $stderr.puts "#{entries.length} entries" if entries.length > 0
 end
 
 def cmd_read
-  if File.exist?(LOG_PATH)
-    $stdout.write(File.read(LOG_PATH))
+  return unless File.exist?(DB_PATH)
+  entries = sql_query("SELECT ts, tool, level, msg, pid, ctx FROM log ORDER BY id ASC;")
+  entries.each do |e|
+    row = { 'ts' => e['ts'], 'tool' => e['tool'], 'level' => e['level'],
+            'msg' => e['msg'], 'pid' => e['pid'] }
+    if e['ctx'] && !e['ctx'].to_s.empty?
+      row['ctx'] = JSON.parse(e['ctx']) rescue e['ctx']
+    end
+    puts JSON.generate(row)
   end
 end
 
-def cmd_rotate(args)
-  keep = (parse_flag(args, '--keep') || '5').to_i
-
-  unless File.exist?(LOG_PATH)
-    $stderr.puts 'spill: nothing to rotate'
+def cmd_cull
+  unless File.exist?(DB_PATH)
+    $stderr.puts 'spill: nothing to cull'
     return
   end
 
-  dir = File.dirname(LOG_PATH)
-  base = File.basename(LOG_PATH, '.jsonl')
-  ts = Time.now.utc.strftime('%Y%m%d-%H%M%S')
-  rotated = File.join(dir, "#{base}-#{ts}.jsonl")
+  count_out, = Open3.capture2('sqlite3', DB_PATH,
+    stdin_data: "SELECT COUNT(*) FROM log;", err: File::NULL)
+  count = count_out.strip.to_i
 
-  FileUtils.mv(LOG_PATH, rotated)
-  $stderr.puts "spill: rotated to #{File.basename(rotated)}"
-
-  # Clean old rotated files
-  old = Dir.glob(File.join(dir, "#{base}-*.jsonl")).sort
-  if old.length > keep
-    old[0...(old.length - keep)].each do |f|
-      File.delete(f)
-      $stderr.puts "spill: removed #{File.basename(f)}"
-    end
+  if count == 0
+    $stderr.puts 'spill: no entries to cull'
+    return
   end
+
+  half = count / 2
+  Open3.capture2('sqlite3', DB_PATH,
+    stdin_data: "DELETE FROM log WHERE id IN " \
+      "(SELECT id FROM log ORDER BY id ASC LIMIT #{half}); VACUUM;",
+    err: File::NULL)
+  $stderr.puts "spill: culled #{half} entries (#{count - half} remaining)"
 end
 
 def usage
@@ -133,10 +145,10 @@ def usage
       search [--tool T] [--level L] [--since TS] [--msg PAT]
                                    Filter entries
       read                         Raw JSONL to stdout
-      rotate [--keep N]            Rotate log, keep N old files (default 5)
+      cull                         Delete oldest 50% of entries and vacuum
 
     Environment:
-      SPILL_LOG   Path to log file (default: .state/spill/spill.jsonl)
+      SPILL_DB   Path to database (default: .state/spill/spill.db)
   USAGE
   exit 1
 end
@@ -146,6 +158,6 @@ case command
 when 'tail'   then cmd_tail(ARGV.dup)
 when 'search' then cmd_search(ARGV.dup)
 when 'read'   then cmd_read
-when 'rotate' then cmd_rotate(ARGV.dup)
+when 'cull'   then cmd_cull
 else usage
 end

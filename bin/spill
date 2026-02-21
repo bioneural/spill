@@ -153,11 +153,42 @@ def usage
   exit 1
 end
 
+def cmd_doctor
+  report = {}
+
+  report['ruby'] = { 'version' => RUBY_VERSION, 'ok' => true }
+
+  # sqlite3 CLI
+  sqlite_out, sqlite_status = Open3.capture2('sqlite3', '--version')
+  report['sqlite3'] = {
+    'version' => sqlite_status.success? ? sqlite_out.strip.split.first : nil,
+    'ok' => sqlite_status.success?
+  }
+
+  # Database
+  report['database'] = {
+    'path' => DB_PATH,
+    'exists' => File.exist?(DB_PATH),
+    'ok' => File.exist?(DB_PATH)
+  }
+
+  if File.exist?(DB_PATH)
+    count_out, = Open3.capture2('sqlite3', DB_PATH,
+      stdin_data: "SELECT COUNT(*) FROM log;", err: File::NULL)
+    report['database']['entries'] = count_out.strip.to_i
+  end
+
+  report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
+  puts JSON.pretty_generate(report)
+  exit(report['ok'] ? 0 : 1)
+end
+
 command = ARGV.shift
 case command
 when 'tail'   then cmd_tail(ARGV.dup)
 when 'search' then cmd_search(ARGV.dup)
 when 'read'   then cmd_read
 when 'cull'   then cmd_cull
+when 'doctor' then cmd_doctor
 else usage
 end

@@ -178,6 +178,27 @@ def cmd_doctor
     report['database']['entries'] = count_out.strip.to_i
   end
 
+  # Probe
+  if ARGV.include?('--probe')
+    if File.exist?(DB_PATH)
+      begin
+        entries = sql_query("SELECT ts, tool, level, msg FROM log ORDER BY id DESC LIMIT 5;")
+        if entries.empty?
+          report['probe'] = { 'ok' => true, 'lines' => 0 }
+        else
+          parseable = entries.all? { |e| JSON.generate(e); true rescue false }
+          report['probe'] = { 'ok' => true, 'lines' => entries.size }
+          report['probe']['warn'] = 'entries not JSON-serializable' unless parseable
+        end
+      rescue => e
+        report['probe'] = { 'ok' => true, 'warn' => "probe error: #{e.message}" }
+      end
+    else
+      report['probe'] = { 'ok' => true, 'skipped' => 'no database' }
+    end
+  end
+
+  report['protocol_version'] = 1
   report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
   puts JSON.pretty_generate(report)
   exit(report['ok'] ? 0 : 1)

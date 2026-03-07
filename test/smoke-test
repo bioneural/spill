@@ -1,445 +1,348 @@
-#!/usr/bin/env bash
+#!/usr/bin/env ruby
+# frozen_string_literal: true
 
-# smoke-test — end-to-end verification of spill structured logging
-#
-# Tests the full cycle: write each level, verify SQLite storage,
-# verify stderr output preserved, test concurrent writes, test CLI.
+# test/smoke-test — end-to-end verification of spill structured logging
 #
 # Usage:
 #   test/smoke-test
 #
-# Dependencies: bash, ruby, sqlite3
+# Dependencies: ruby, sqlite3
 #
 # Behavior:
-#   1. Runs each test in sequence
-#   2. Prints pass/fail for each
-#   3. Exits 0 if all pass, 1 if any fail
+#   1. Tests structure and syntax
+#   2. Tests logging at all levels with database verification
+#   3. Tests fail-open behavior
+#   4. Tests concurrent writes
+#   5. Tests CLI commands (tail, search, read, cull)
+#   6. Tests auto-culling
+#   7. Reports pass/fail, exits 0/1
 
-set -uo pipefail
+require_relative '../../prophet/test/lib/test_harness'
+include TestHarness
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SPILL_ROOT="$(dirname "$SCRIPT_DIR")"
-cd "$SPILL_ROOT"
+require 'open3'
+require 'json'
+require 'tmpdir'
+require 'fileutils'
 
-passed=0
-failed=0
-failures=()
+SPILL_ROOT = File.expand_path('..', __dir__)
+SPILL_LIB  = File.join(SPILL_ROOT, 'lib', 'spill.rb')
+SPILL_BIN  = File.join(SPILL_ROOT, 'bin', 'spill')
+SQLITE3    = ENV['SQLITE3'] || '/opt/homebrew/opt/sqlite/bin/sqlite3'
 
-pass() {
-  printf "  \033[32m✓\033[0m %s\n" "$1"
-  ((passed++))
-}
+tmpdir = Dir.mktmpdir('spill-test')
+test_db = File.join(tmpdir, 'spill.db')
 
-fail() {
-  printf "  \033[31m✗\033[0m %s — %s\n" "$1" "$2"
-  ((failed++))
-  failures+=("$1")
-}
+at_exit { FileUtils.rm_rf(tmpdir) }
 
-section() {
-  printf "\n\033[1m%s\033[0m\n" "$1"
-}
+# -- Structure --
 
-# ---------------------------------------------------------------------------
-section "Structure"
-# ---------------------------------------------------------------------------
+section 'Structure'
 
-test_structure() {
-  local missing=()
-  local paths=(
-    "lib/spill.rb"
-    "bin/spill"
-    "test/smoke-test"
-    "README.md"
-    "LICENSE"
-  )
-  for p in "${paths[@]}"; do
-    [[ -e "$p" ]] || missing+=("$p")
-  done
-  if [[ ${#missing[@]} -eq 0 ]]; then
-    pass "All expected paths exist"
+%w[lib/spill.rb bin/spill test/smoke-test README.md LICENSE].each do |f|
+  path = File.join(SPILL_ROOT, f)
+  if File.exist?(path)
+    pass "#{f} exists"
   else
-    fail "Missing paths" "${missing[*]}"
-  fi
-}
-test_structure
+    fail f, 'not found'
+  end
+end
 
-test_executables() {
-  local not_exec=()
-  for script in bin/spill test/smoke-test; do
-    [[ -x "$script" ]] || not_exec+=("$script")
-  done
-  if [[ ${#not_exec[@]} -eq 0 ]]; then
-    pass "All scripts are executable"
+%w[bin/spill test/smoke-test].each do |f|
+  path = File.join(SPILL_ROOT, f)
+  if File.executable?(path)
+    pass "#{f} is executable"
   else
-    fail "Not executable" "${not_exec[*]}"
-  fi
-}
-test_executables
+    fail f, 'not executable'
+  end
+end
 
-# ---------------------------------------------------------------------------
-section "Syntax"
-# ---------------------------------------------------------------------------
+# -- Syntax --
 
-test_ruby_syntax() {
-  local bad=()
-  for script in lib/spill.rb bin/spill; do
-    ruby -c "$script" >/dev/null 2>&1 || bad+=("$script")
-  done
-  if [[ ${#bad[@]} -eq 0 ]]; then
-    pass "Ruby scripts pass syntax check"
+section 'Syntax'
+
+%w[lib/spill.rb bin/spill].each do |f|
+  path = File.join(SPILL_ROOT, f)
+  _, status = Open3.capture2('ruby', '-c', path, err: File::NULL)
+  if status.success?
+    pass "#{f} passes syntax check"
   else
-    fail "Syntax errors" "${bad[*]}"
-  fi
-}
-test_ruby_syntax
+    fail "#{f} syntax", 'syntax error'
+  end
+end
 
-# ---------------------------------------------------------------------------
-section "Logging"
-# ---------------------------------------------------------------------------
+# -- Logging --
 
-TMPDIR_TEST=$(mktemp -d)
-TEST_DB="$TMPDIR_TEST/spill.db"
+section 'Logging'
 
-test_log_levels() {
-  local output
-  output=$(ruby -e '
-    require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "test-tool", db: "'"$TEST_DB"'")
-    Spill.info("info message", key: "val")
-    Spill.warn("warn message")
-    Spill.error("error message", code: 1)
-    Spill.debug("debug message")
-  ' 2>&1)
+log_script = <<~RUBY
+  require '#{SPILL_LIB}'
+  Spill.configure(tool: 'test-tool', db: '#{test_db}', level: 'debug')
+  Spill.info('info message', key: 'val')
+  Spill.warn('warn message')
+  Spill.error('error message', code: 1)
+  Spill.debug('debug message')
+RUBY
 
-  # Check stderr preserves tool: msg format
-  if echo "$output" | grep -q "test-tool: info message" && \
-     echo "$output" | grep -q "test-tool: warn message" && \
-     echo "$output" | grep -q "test-tool: error message" && \
-     echo "$output" | grep -q "test-tool: debug message"; then
-    pass "stderr output preserves tool: msg format"
+output, = Open3.capture2e('ruby', '-e', log_script)
+
+# Stderr format
+%w[info warn error debug].each do |level|
+  if output.include?("test-tool: #{level} message")
+    pass "stderr output for #{level}"
   else
-    fail "stderr format" "expected 'test-tool: <msg>' for each level, got: $output"
-  fi
+    fail "stderr #{level}", "missing 'test-tool: #{level} message'"
+  end
+end
 
-  # Check database has 4 entries
-  if [[ -f "$TEST_DB" ]]; then
-    local count
-    count=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM log;" 2>/dev/null)
-    if [[ "$count" -eq 4 ]]; then
-      pass "Database has 4 entries (one per level)"
-    else
-      fail "Entry count" "expected 4, got $count"
-    fi
+# Database entry count
+if File.exist?(test_db)
+  count_out, = Open3.capture2(SQLITE3, test_db, 'SELECT COUNT(*) FROM log;')
+  count = count_out.strip.to_i
+  if count == 4
+    pass 'Database has 4 entries (one per level)'
   else
-    fail "Database" "not created at $TEST_DB"
-    return
-  fi
+    fail 'Entry count', "expected 4, got #{count}"
+  end
+else
+  fail 'Database', "not created at #{test_db}"
+end
 
-  # Check schema has expected columns
-  local cols
-  cols=$(sqlite3 "$TEST_DB" "PRAGMA table_info(log);" 2>/dev/null | cut -d'|' -f2 | tr '\n' ',')
-  if [[ "$cols" == *"ts,"*"tool,"*"level,"*"msg,"*"pid,"*"ctx,"* ]]; then
-    pass "Schema has all expected columns"
-  else
-    fail "Schema" "columns: $cols"
-  fi
+# Schema columns
+cols_out, = Open3.capture2(SQLITE3, test_db, 'PRAGMA table_info(log);')
+col_names = cols_out.lines.map { |l| l.split('|')[1] }
+expected_cols = %w[ts tool level msg pid ctx]
+missing_cols = expected_cols - col_names
+if missing_cols.empty?
+  pass 'Schema has all expected columns'
+else
+  fail 'Schema', "missing columns: #{missing_cols.join(', ')}"
+end
 
-  # Check indexes exist
-  local idx_count
-  idx_count=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='log';" 2>/dev/null)
-  if [[ "$idx_count" -ge 4 ]]; then
-    pass "All indexes present (found $idx_count)"
-  else
-    fail "Indexes" "expected >= 4, found $idx_count"
-  fi
+# Indexes
+idx_out, = Open3.capture2(SQLITE3, test_db,
+  "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='log';")
+idx_count = idx_out.strip.to_i
+if idx_count >= 4
+  pass "All indexes present (found #{idx_count})"
+else
+  fail 'Indexes', "expected >= 4, found #{idx_count}"
+end
 
-  # Check required fields are populated
-  local null_check
-  null_check=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM log WHERE ts IS NULL OR tool IS NULL OR level IS NULL OR msg IS NULL OR pid IS NULL;" 2>/dev/null)
-  if [[ "$null_check" -eq 0 ]]; then
-    pass "All entries have required fields populated"
-  else
-    fail "Required fields" "$null_check entries with NULL required fields"
-  fi
+# Required fields populated
+null_out, = Open3.capture2(SQLITE3, test_db,
+  'SELECT COUNT(*) FROM log WHERE ts IS NULL OR tool IS NULL OR level IS NULL OR msg IS NULL OR pid IS NULL;')
+if null_out.strip.to_i == 0
+  pass 'All entries have required fields populated'
+else
+  fail 'Required fields', "#{null_out.strip} entries with NULL"
+end
 
-  # Check ctx present when kwargs given, absent when not
-  local ctx_check
-  ctx_check=$(ruby -rjson -e '
-    require "open3"
-    out, = Open3.capture2("sqlite3", "-json", "'"$TEST_DB"'",
-      stdin_data: "SELECT level, ctx FROM log;", err: File::NULL)
-    rows = JSON.parse(out)
-    info = rows.find { |r| r["level"] == "info" }
-    error = rows.find { |r| r["level"] == "error" }
-    warn_entry = rows.find { |r| r["level"] == "warn" }
-    info_ctx = JSON.parse(info["ctx"])
-    error_ctx = JSON.parse(error["ctx"])
-    ok = info_ctx == {"key" => "val"} &&
-         error_ctx == {"code" => 1} &&
-         (warn_entry["ctx"].nil? || warn_entry["ctx"].to_s.empty?)
-    puts ok ? "ok" : "fail"
-  ')
-  if [[ "$ctx_check" == "ok" ]]; then
-    pass "ctx field present when kwargs given, absent when not"
-  else
-    fail "ctx field" "unexpected ctx presence/absence"
-  fi
-}
-test_log_levels
+# ctx field presence
+ctx_script = <<~RUBY
+  require 'json'
+  require 'open3'
+  out, = Open3.capture2('#{SQLITE3}', '-json', '#{test_db}', stdin_data: 'SELECT level, ctx FROM log;', err: File::NULL)
+  rows = JSON.parse(out)
+  info = rows.find { |r| r['level'] == 'info' }
+  error_r = rows.find { |r| r['level'] == 'error' }
+  warn_r = rows.find { |r| r['level'] == 'warn' }
+  info_ctx = JSON.parse(info['ctx'])
+  error_ctx = JSON.parse(error_r['ctx'])
+  ok = info_ctx == { 'key' => 'val' } &&
+       error_ctx == { 'code' => 1 } &&
+       (warn_r['ctx'].nil? || warn_r['ctx'].to_s.empty?)
+  puts ok ? 'ok' : 'fail'
+RUBY
+ctx_out, = Open3.capture2('ruby', '-e', ctx_script)
+if ctx_out.strip == 'ok'
+  pass 'ctx field present when kwargs given, absent when not'
+else
+  fail 'ctx field', 'unexpected presence/absence'
+end
 
-test_ts_format() {
-  local ts
-  ts=$(sqlite3 "$TEST_DB" "SELECT ts FROM log LIMIT 1;" 2>/dev/null)
-  if [[ "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]]; then
-    pass "Timestamp is ISO 8601 UTC with milliseconds"
-  else
-    fail "Timestamp format" "got: $ts"
-  fi
-}
-test_ts_format
+# Timestamp format
+ts_out, = Open3.capture2(SQLITE3, test_db, 'SELECT ts FROM log LIMIT 1;')
+ts = ts_out.strip
+if ts.match?(/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\z/)
+  pass 'Timestamp is ISO 8601 UTC with milliseconds'
+else
+  fail 'Timestamp format', "got: #{ts}"
+end
 
-test_wal_mode() {
-  local mode
-  mode=$(sqlite3 "$TEST_DB" "PRAGMA journal_mode;" 2>/dev/null)
-  if [[ "$mode" == "wal" ]]; then
-    pass "Database uses WAL journal mode"
-  else
-    fail "Journal mode" "expected wal, got $mode"
-  fi
-}
-test_wal_mode
+# WAL mode
+mode_out, = Open3.capture2(SQLITE3, test_db, 'PRAGMA journal_mode;')
+if mode_out.strip == 'wal'
+  pass 'Database uses WAL journal mode'
+else
+  fail 'Journal mode', "expected wal, got #{mode_out.strip}"
+end
 
-# ---------------------------------------------------------------------------
-section "Fail-open"
-# ---------------------------------------------------------------------------
+# -- Fail-open --
 
-test_fail_open() {
-  local output
-  output=$(ruby -e '
-    require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "test-fail", db: "/nonexistent/path/spill.db")
-    Spill.error("should still reach stderr")
-  ' 2>&1)
-  if echo "$output" | grep -q "test-fail: should still reach stderr"; then
-    pass "Fail-open: stderr works when database path is unreachable"
-  else
-    fail "Fail-open" "stderr output missing"
-  fi
-}
-test_fail_open
+section 'Fail-open'
 
-test_no_config() {
-  local output
-  output=$(ruby -e '
-    require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.info("unconfigured message")
-  ' 2>&1)
-  if echo "$output" | grep -q "unknown: unconfigured message"; then
-    pass "Unconfigured tool defaults to 'unknown'"
-  else
-    fail "Unconfigured default" "expected 'unknown: ...', got: $output"
-  fi
-}
-test_no_config
+failopen_script = <<~RUBY
+  require '#{SPILL_LIB}'
+  Spill.configure(tool: 'test-fail', db: '/nonexistent/path/spill.db')
+  Spill.error('should still reach stderr')
+RUBY
+fo_out, = Open3.capture2e('ruby', '-e', failopen_script)
+if fo_out.include?('test-fail: should still reach stderr')
+  pass 'Fail-open: stderr works when database path is unreachable'
+else
+  fail 'Fail-open', 'stderr output missing'
+end
 
-# ---------------------------------------------------------------------------
-section "Concurrent writes"
-# ---------------------------------------------------------------------------
+noconfig_script = <<~RUBY
+  require '#{SPILL_LIB}'
+  Spill.info('unconfigured message')
+RUBY
+nc_out, = Open3.capture2e('ruby', '-e', noconfig_script)
+if nc_out.include?('unknown: unconfigured message')
+  pass "Unconfigured tool defaults to 'unknown'"
+else
+  fail 'Unconfigured default', "expected 'unknown: ...', got: #{nc_out}"
+end
 
-test_concurrent() {
-  local concurrent_db="$TMPDIR_TEST/concurrent.db"
-  ruby -e '
-    require "'"$SPILL_ROOT/lib/spill"'"
-    pids = 5.times.map do |i|
-      fork do
-        Spill.configure(tool: "worker-#{i}", db: "'"$concurrent_db"'")
-        10.times { |j| Spill.info("msg #{j}") }
-      end
+# -- Concurrent writes --
+
+section 'Concurrent writes'
+
+concurrent_db = File.join(tmpdir, 'concurrent.db')
+concurrent_script = <<~RUBY
+  require '#{SPILL_LIB}'
+  pids = 5.times.map do |i|
+    fork do
+      Spill.configure(tool: "worker-\#{i}", db: '#{concurrent_db}')
+      10.times { |j| Spill.info("msg \#{j}") }
     end
-    pids.each { |p| Process.wait(p) }
-  ' 2>/dev/null
+  end
+  pids.each { |p| Process.wait(p) }
+RUBY
+Open3.capture2e('ruby', '-e', concurrent_script)
 
-  if [[ -f "$concurrent_db" ]]; then
-    local count
-    count=$(sqlite3 "$concurrent_db" "SELECT COUNT(*) FROM log;" 2>/dev/null)
-    if [[ "$count" -eq 50 ]]; then
-      pass "Concurrent writes: 50 entries from 5 workers"
-    else
-      fail "Concurrent writes" "expected 50 entries, got $count"
-    fi
-
-    # Verify entries have valid data
-    local bad
-    bad=$(sqlite3 "$concurrent_db" "SELECT COUNT(*) FROM log WHERE ts IS NULL OR tool IS NULL OR msg IS NULL;" 2>/dev/null)
-    if [[ "$bad" -eq 0 ]]; then
-      pass "Concurrent writes: all entries have valid data"
-    else
-      fail "Concurrent data" "$bad entries with NULL fields"
-    fi
+if File.exist?(concurrent_db)
+  c_out, = Open3.capture2(SQLITE3, concurrent_db, 'SELECT COUNT(*) FROM log;')
+  c_count = c_out.strip.to_i
+  if c_count == 50
+    pass 'Concurrent writes: 50 entries from 5 workers'
   else
-    fail "Concurrent writes" "database not created"
-  fi
-}
-test_concurrent
+    fail 'Concurrent writes', "expected 50 entries, got #{c_count}"
+  end
 
-# ---------------------------------------------------------------------------
-section "CLI — bin/spill"
-# ---------------------------------------------------------------------------
-
-test_cli_tail() {
-  export SPILL_DB="$TEST_DB"
-  local output
-  output=$(ruby bin/spill tail --lines 2 2>/dev/null)
-  local count
-  count=$(echo "$output" | grep -c "test-tool")
-  if [[ "$count" -eq 2 ]]; then
-    pass "bin/spill tail --lines 2 shows 2 entries"
+  bad_out, = Open3.capture2(SQLITE3, concurrent_db,
+    'SELECT COUNT(*) FROM log WHERE ts IS NULL OR tool IS NULL OR msg IS NULL;')
+  if bad_out.strip.to_i == 0
+    pass 'Concurrent writes: all entries have valid data'
   else
-    fail "bin/spill tail" "expected 2 entries, got $count"
-  fi
-}
-test_cli_tail
+    fail 'Concurrent data', "#{bad_out.strip} entries with NULL fields"
+  end
+else
+  fail 'Concurrent writes', 'database not created'
+end
 
-test_cli_search_tool() {
-  export SPILL_DB="$TEST_DB"
-  local output
-  output=$(ruby bin/spill search --tool test-tool --level error 2>/dev/null)
-  if echo "$output" | grep -q "error message"; then
-    pass "bin/spill search --tool --level filters correctly"
+# -- CLI --
+
+section 'CLI — bin/spill'
+
+env = { 'SPILL_DB' => test_db }
+
+tail_out, = Open3.capture2(env, 'ruby', SPILL_BIN, 'tail', '--lines', '2', err: File::NULL)
+tail_count = tail_out.lines.count { |l| l.include?('test-tool') }
+if tail_count == 2
+  pass 'bin/spill tail --lines 2 shows 2 entries'
+else
+  fail 'bin/spill tail', "expected 2 entries, got #{tail_count}"
+end
+
+search_out, = Open3.capture2(env, 'ruby', SPILL_BIN, 'search', '--tool', 'test-tool', '--level', 'error', err: File::NULL)
+if search_out.include?('error message')
+  pass 'bin/spill search --tool --level filters correctly'
+else
+  fail 'bin/spill search', 'expected error message in output'
+end
+
+search_msg_out, = Open3.capture2(env, 'ruby', SPILL_BIN, 'search', '--msg', 'warn', err: File::NULL)
+if search_msg_out.include?('warn message')
+  pass 'bin/spill search --msg filters by message content'
+else
+  fail 'bin/spill search --msg', 'expected warn message'
+end
+
+read_out, = Open3.capture2(env, 'ruby', SPILL_BIN, 'read')
+read_lines = read_out.lines.reject(&:empty?).size
+if read_lines == 4
+  pass 'bin/spill read outputs 4 JSONL lines'
+else
+  fail 'bin/spill read', "expected 4 lines, got #{read_lines}"
+end
+
+bad_json = read_out.lines.reject(&:empty?).count { |l| (JSON.parse(l) rescue nil).nil? }
+if bad_json == 0
+  pass 'bin/spill read outputs valid JSON per line'
+else
+  fail 'bin/spill read JSON', "#{bad_json} invalid lines"
+end
+
+# Cull
+cull_db = File.join(tmpdir, 'cull-cli.db')
+cull_script = <<~RUBY
+  require '#{SPILL_LIB}'
+  Spill.configure(tool: 'cull-test', db: '#{cull_db}')
+  10.times { |i| Spill.info("entry \#{i}") }
+RUBY
+Open3.capture2e('ruby', '-e', cull_script)
+
+before_out, = Open3.capture2(SQLITE3, cull_db, 'SELECT COUNT(*) FROM log;')
+before = before_out.strip.to_i
+Open3.capture2({ 'SPILL_DB' => cull_db }, 'ruby', SPILL_BIN, 'cull', err: File::NULL)
+after_out, = Open3.capture2(SQLITE3, cull_db, 'SELECT COUNT(*) FROM log;')
+after = after_out.strip.to_i
+
+if before == 10 && after == 5
+  pass 'bin/spill cull removes oldest 50% of entries'
+else
+  fail 'bin/spill cull', "expected 10 -> 5, got #{before} -> #{after}"
+end
+
+# -- Auto-culling --
+
+section 'Auto-culling'
+
+autocull_db = File.join(tmpdir, 'auto-cull.db')
+autocull_script = <<~RUBY
+  require '#{SPILL_LIB}'
+  Spill.configure(tool: 'cull-test', db: '#{autocull_db}', max_size: 8192)
+  200.times { |i| Spill.info("auto-cull message number \#{i} with padding to increase row size significantly") }
+RUBY
+Open3.capture2e('ruby', '-e', autocull_script)
+
+if File.exist?(autocull_db)
+  ac_out, = Open3.capture2(SQLITE3, autocull_db, 'SELECT COUNT(*) FROM log;')
+  ac_count = ac_out.strip.to_i
+  if ac_count < 200
+    pass "Auto-culling reduced entries (#{ac_count} < 200)"
   else
-    fail "bin/spill search" "expected error message in output"
-  fi
-}
-test_cli_search_tool
+    fail 'Auto-culling', "expected fewer than 200 entries, got #{ac_count}"
+  end
+else
+  fail 'Auto-culling', 'database not created'
+end
 
-test_cli_search_msg() {
-  export SPILL_DB="$TEST_DB"
-  local output
-  output=$(ruby bin/spill search --msg "warn" 2>/dev/null)
-  if echo "$output" | grep -q "warn message"; then
-    pass "bin/spill search --msg filters by message content"
-  else
-    fail "bin/spill search --msg" "expected warn message in output"
-  fi
-}
-test_cli_search_msg
+nocull_db = File.join(tmpdir, 'no-cull.db')
+nocull_script = <<~RUBY
+  require '#{SPILL_LIB}'
+  Spill.configure(tool: 'no-cull', db: '#{nocull_db}', max_size: 0)
+  20.times { |i| Spill.info("no cull \#{i}") }
+RUBY
+Open3.capture2e('ruby', '-e', nocull_script)
 
-test_cli_read() {
-  export SPILL_DB="$TEST_DB"
-  local output
-  output=$(ruby bin/spill read)
-  local lines
-  lines=$(echo "$output" | wc -l | tr -d ' ')
-  if [[ "$lines" -eq 4 ]]; then
-    pass "bin/spill read outputs 4 JSONL lines"
-  else
-    fail "bin/spill read" "expected 4 lines, got $lines"
-  fi
+nc_count_out, = Open3.capture2(SQLITE3, nocull_db, 'SELECT COUNT(*) FROM log;')
+if nc_count_out.strip.to_i == 20
+  pass 'Auto-culling disabled when max_size is 0'
+else
+  fail 'Culling disabled', "expected 20 entries, got #{nc_count_out.strip}"
+end
 
-  # Verify each line is valid JSON
-  local bad_json=0
-  while IFS= read -r line; do
-    echo "$line" | ruby -rjson -e 'JSON.parse($stdin.read)' 2>/dev/null || ((bad_json++))
-  done <<< "$output"
-  if [[ "$bad_json" -eq 0 ]]; then
-    pass "bin/spill read outputs valid JSON per line"
-  else
-    fail "bin/spill read JSON" "$bad_json invalid lines"
-  fi
-}
-test_cli_read
-
-test_cli_cull() {
-  export SPILL_DB="$TMPDIR_TEST/cull-cli.db"
-  ruby -e '
-    require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "cull-test", db: "'"$TMPDIR_TEST/cull-cli.db"'")
-    10.times { |i| Spill.info("entry #{i}") }
-  ' 2>/dev/null
-
-  local before
-  before=$(sqlite3 "$SPILL_DB" "SELECT COUNT(*) FROM log;" 2>/dev/null)
-  ruby bin/spill cull 2>/dev/null
-  local after
-  after=$(sqlite3 "$SPILL_DB" "SELECT COUNT(*) FROM log;" 2>/dev/null)
-
-  if [[ "$after" -eq 5 ]] && [[ "$before" -eq 10 ]]; then
-    pass "bin/spill cull removes oldest 50% of entries"
-  else
-    fail "bin/spill cull" "expected 10 -> 5, got $before -> $after"
-  fi
-}
-test_cli_cull
-
-# ---------------------------------------------------------------------------
-section "Auto-culling"
-# ---------------------------------------------------------------------------
-
-test_auto_cull() {
-  local cull_db="$TMPDIR_TEST/auto-cull.db"
-
-  # max_size=8192 (8 KB): should trigger culling after enough writes
-  ruby -e '
-    require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "cull-test", db: "'"$cull_db"'", max_size: 8192)
-    200.times { |i| Spill.info("auto-cull message number #{i} with padding to increase row size significantly") }
-  ' 2>/dev/null
-
-  if [[ -f "$cull_db" ]]; then
-    local count
-    count=$(sqlite3 "$cull_db" "SELECT COUNT(*) FROM log;" 2>/dev/null)
-    if [[ "$count" -lt 200 ]]; then
-      pass "Auto-culling reduced entries (${count} < 200)"
-    else
-      fail "Auto-culling" "expected fewer than 200 entries, got $count"
-    fi
-  else
-    fail "Auto-culling" "database not created"
-  fi
-}
-test_auto_cull
-
-test_cull_disabled() {
-  local nodis_db="$TMPDIR_TEST/no-cull.db"
-
-  # max_size=0 disables auto-culling
-  ruby -e '
-    require "'"$SPILL_ROOT/lib/spill"'"
-    Spill.configure(tool: "no-cull", db: "'"$nodis_db"'", max_size: 0)
-    20.times { |i| Spill.info("no cull #{i}") }
-  ' 2>/dev/null
-
-  local count
-  count=$(sqlite3 "$nodis_db" "SELECT COUNT(*) FROM log;" 2>/dev/null)
-  if [[ "$count" -eq 20 ]]; then
-    pass "Auto-culling disabled when max_size is 0"
-  else
-    fail "Culling disabled" "expected 20 entries, got $count"
-  fi
-}
-test_cull_disabled
-
-# Clean up
-rm -rf "$TMPDIR_TEST"
-unset SPILL_DB
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
-printf "\n\033[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"
-printf "\033[1m%d passed\033[0m" "$passed"
-[[ $failed -gt 0 ]] && printf ", \033[31m%d failed\033[0m" "$failed"
-printf "\n"
-
-if [[ $failed -gt 0 ]]; then
-  printf "\n\033[31mFailing:\033[0m\n"
-  for f in "${failures[@]}"; do
-    printf "  • %s\n" "$f"
-  done
-  printf "\n"
-  exit 1
-fi
-
-exit 0
+finish!

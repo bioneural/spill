@@ -18,43 +18,34 @@
 #   - Auto-culls oldest 50% of entries when database exceeds max_size (default 10 MB)
 #   - Fail-open: if database write or culling fails, stderr still works
 #
-# Dependencies: ruby stdlib (json, fileutils, open3), sqlite3 CLI
+# Dependencies: ruby stdlib (json, fileutils), sqlite3 gem
 
 require 'json'
 require 'fileutils'
-require 'open3'
+require 'sqlite3'
 
 module Spill
-  INIT_SQL = <<~SQL.freeze
-    PRAGMA journal_mode = WAL;
-    CREATE TABLE IF NOT EXISTS log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts TEXT NOT NULL,
-      tool TEXT NOT NULL,
-      level TEXT NOT NULL,
-      msg TEXT NOT NULL,
-      pid INTEGER NOT NULL,
-      ctx TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_log_ts ON log(ts);
-    CREATE INDEX IF NOT EXISTS idx_log_tool ON log(tool);
-    CREATE INDEX IF NOT EXISTS idx_log_level ON log(level);
-    CREATE INDEX IF NOT EXISTS idx_log_tool_level ON log(tool, level);
-  SQL
+  LEVELS = %w[debug info warn error].freeze
+  LEVEL_RANK = LEVELS.each_with_index.to_h.freeze  # {"debug"=>0, "info"=>1, ...}
 
   @tool = 'unknown'
   @db_path = nil
+  @db = nil
   @max_size = 10_485_760
   @initialized = false
+  @min_level = LEVEL_RANK['info']
 
   module_function
 
-  def configure(tool:, db: nil, max_size: nil)
+  def configure(tool:, db: nil, max_size: nil, level: nil)
     @tool = tool
     @db_path = db || ENV.fetch('SPILL_DB') {
       File.join(Dir.pwd, '.state', 'spill', 'spill.db')
     }
     @max_size = max_size || ENV.fetch('SPILL_MAX_SIZE', 10_485_760).to_i
+    @min_level = LEVEL_RANK.fetch(level.to_s, LEVEL_RANK['info'])
+    @db&.close rescue nil
+    @db = nil
     @initialized = false
   end
 
@@ -64,18 +55,20 @@ module Spill
   def debug(msg, **ctx) ; _log('debug', msg, ctx) end
 
   def _log(level, msg, ctx)
-    $stderr.puts "#{@tool}: #{msg}"
+    rank = LEVEL_RANK.fetch(level, 0)
+    if rank >= @min_level
+      $stderr.puts "#{@tool}: #{msg}"
+    end
     return unless @db_path
 
     _init_db unless @initialized
 
     ts = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%S.%3NZ')
-    ctx_sql = ctx.empty? ? 'NULL' : "'#{_esc(JSON.generate(ctx))}'"
-    sql = "INSERT INTO log (ts,tool,level,msg,pid,ctx) VALUES (" \
-      "'#{ts}','#{_esc(@tool)}','#{_esc(level)}'," \
-      "'#{_esc(msg)}',#{Process.pid},#{ctx_sql});"
-
-    _sql(sql)
+    ctx_val = ctx.empty? ? nil : JSON.generate(ctx)
+    @db.execute(
+      'INSERT INTO log (ts, tool, level, msg, pid, ctx) VALUES (?, ?, ?, ?, ?, ?)',
+      [ts, @tool, level, msg, Process.pid, ctx_val]
+    )
     _maybe_cull
   rescue
     # fail-open: stderr already has the message
@@ -84,19 +77,27 @@ module Spill
   def _init_db
     dir = File.dirname(@db_path)
     FileUtils.mkdir_p(dir) unless File.directory?(dir)
-    _sql(INIT_SQL)
+    @db = SQLite3::Database.new(@db_path)
+    @db.busy_timeout = 5000
+    @db.journal_mode = 'wal'
+    @db.execute_batch(<<~SQL)
+      CREATE TABLE IF NOT EXISTS log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        level TEXT NOT NULL,
+        msg TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        ctx TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_log_ts ON log(ts);
+      CREATE INDEX IF NOT EXISTS idx_log_tool ON log(tool);
+      CREATE INDEX IF NOT EXISTS idx_log_level ON log(level);
+      CREATE INDEX IF NOT EXISTS idx_log_tool_level ON log(tool, level);
+    SQL
     @initialized = true
   rescue
     # fail-open
-  end
-
-  def _sql(sql)
-    Open3.capture2('sqlite3', @db_path,
-      stdin_data: "PRAGMA busy_timeout = 5000;\n#{sql}", err: File::NULL)
-  end
-
-  def _esc(str)
-    str.to_s.gsub("'", "''")
   end
 
   def _maybe_cull
@@ -104,9 +105,12 @@ module Spill
     return unless File.exist?(@db_path)
     return unless _db_size >= @max_size
 
-    _sql("DELETE FROM log WHERE id IN " \
-      "(SELECT id FROM log ORDER BY id ASC LIMIT " \
-      "(SELECT COUNT(*) / 2 FROM log)); VACUUM;")
+    @db.execute_batch(<<~SQL)
+      DELETE FROM log WHERE id IN
+        (SELECT id FROM log ORDER BY id ASC LIMIT
+        (SELECT COUNT(*) / 2 FROM log));
+      VACUUM;
+    SQL
   rescue
     # fail-open: culling failure never breaks the tool
   end
@@ -118,5 +122,5 @@ module Spill
     size
   end
 
-  private_class_method :_log, :_init_db, :_sql, :_esc, :_maybe_cull, :_db_size
+  private_class_method :_log, :_init_db, :_maybe_cull, :_db_size
 end
